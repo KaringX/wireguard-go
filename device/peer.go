@@ -120,14 +120,14 @@ func (peer *Peer) SendBuffersWithoutModify(buffers [][]byte) error { //hiddify
 		return nil
 	}
 
-	peer.RLock()
-	defer peer.RUnlock()
+	peer.endpoint.Lock()
+	defer peer.endpoint.Unlock()
 
-	if peer.endpoint == nil {
+	if peer.endpoint.val == nil {
 		return errors.New("no known endpoint for peer")
 	}
 	//Hiddify-GFW-knocker
-	err := peer.device.net.bind.SendWithoutModify(buffers, peer.endpoint)
+	err := peer.device.net.bind.SendWithoutModify(buffers, peer.endpoint.val)
 	if err == nil {
 		var totalLen uint64
 		for _, b := range buffers {

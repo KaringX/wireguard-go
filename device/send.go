@@ -17,10 +17,6 @@ import (
 	"sync"
 	"time"
 
-	"crypto/rand"
-	"fmt"
-	"math/big"
-
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/tun"
 	"golang.org/x/crypto/chacha20poly1305"
