@@ -49,6 +49,9 @@ type Bind interface {
 	// bufs must not exceed BatchSize().
 	Send(bufs [][]byte, ep Endpoint) error
 
+	//Hiddify-GFW-knocker
+	SendWithoutModify(bufs [][]byte, ep Endpoint) error //hiddify
+
 	// ParseEndpoint creates a new endpoint from a string.
 	ParseEndpoint(s string) (Endpoint, error)
 
@@ -56,7 +59,7 @@ type Bind interface {
 	// the ReceiveFuncs, and the maximum expected to be passed to SendBatch.
 	BatchSize() int
 
-	SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte)
+	SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) //hiddify
 }
 
 // BindSocketToInterface is implemented by Bind objects that support being

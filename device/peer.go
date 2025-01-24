@@ -112,6 +112,31 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 
 	return peer, nil
 }
+func (peer *Peer) SendBuffersWithoutModify(buffers [][]byte) error { //hiddify
+	peer.device.net.RLock()
+	defer peer.device.net.RUnlock()
+
+	if peer.device.isClosed() {
+		return nil
+	}
+
+	peer.RLock()
+	defer peer.RUnlock()
+
+	if peer.endpoint == nil {
+		return errors.New("no known endpoint for peer")
+	}
+	//Hiddify-GFW-knocker
+	err := peer.device.net.bind.SendWithoutModify(buffers, peer.endpoint)
+	if err == nil {
+		var totalLen uint64
+		for _, b := range buffers {
+			totalLen += uint64(len(b))
+		}
+		peer.txBytes.Add(totalLen)
+	}
+	return err
+}
 
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	peer.device.net.RLock()
@@ -263,7 +288,10 @@ func (peer *Peer) Stop() {
 	if !peer.isRunning.Swap(false) {
 		return
 	}
-
+	select { //hiddify
+	case peer.device.stopCh <- 1:
+	default:
+	}
 	peer.device.log.Verbosef("%v - Stopping", peer)
 
 	peer.timersStop()
