@@ -576,8 +576,13 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 
 func (peer *Peer) customSend(clist []byte, payload []byte, noModify bool) error { //hiddify
 	//{GFW-knocker
+	var a1 byte
+	if len(clist) > 0 {
+		a1 = clist[randomInt(0, len(clist)-1)]
+	} else {
+		a1 = 0x00
+	}
 
-	a1 := clist[randomInt(0, len(clist)-1)]
 	a2 := []byte{a1, 0x00, 0x00, 0x00, 0x01, 0x08}
 	a3 := make([]byte, 8)
 	_, err3 := rand.Read(a3)
@@ -617,7 +622,7 @@ func (peer *Peer) sendNoise() error { //hiddify
 		if err != nil {
 			return fmt.Errorf("error generating random packet: %v", err)
 		}
-		peer.customSend(peer.device.FakePacketsHeader, randomPayload, peer.device.FakePacketsNoModify)
+		err = peer.customSend(peer.device.FakePacketsHeader, randomPayload, peer.device.FakePacketsNoModify)
 		if err != nil {
 			return fmt.Errorf("error sending random packet: %v", err)
 		}
