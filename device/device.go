@@ -7,6 +7,7 @@ package device
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -90,10 +91,16 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
-	ipcMutex     sync.RWMutex
-	closed       chan struct{}
-	log          *Logger
-	pauseManager pause.Manager
+	ipcMutex            sync.RWMutex
+	closed              chan struct{}
+	log                 *Logger
+	pauseManager        pause.Manager
+	FakePackets         []int    //hiddify
+	FakePacketsDelays   []int    //hiddify
+	FakePacketsSize     []int    //hiddify
+	FakePacketsHeader   []byte   //hiddify
+	FakePacketsNoModify bool     //hiddify
+	stopCh              chan int //hiddify
 }
 
 // deviceState represents the state of a Device.
@@ -128,6 +135,10 @@ func (device *Device) isClosed() bool {
 // See device.state.state comments for how to interpret this value.
 func (device *Device) isUp() bool {
 	return device.deviceState() == deviceStateUp
+}
+
+func (device *Device) IsUp() bool { //hiddify
+	return device.isUp()
 }
 
 // Must hold device.peers.Lock()
@@ -176,7 +187,7 @@ func (device *Device) changeState(want deviceState) (err error) {
 func (device *Device) upLocked() error {
 	if err := device.BindUpdate(); err != nil {
 		device.log.Errorf("Unable to update bind: %v", err)
-		return err
+		return fmt.Errorf("Unable to update bind: %v", err) //hiddify
 	}
 
 	// The IPC set operation waits for peers to be created before calling Start() on them,
@@ -289,6 +300,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger *Logger, workers int) *Device {
 	device := new(Device)
 	device.pauseManager = service.FromContext[pause.Manager](ctx)
+	device.stopCh = make(chan int, 1) //hiddify
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
@@ -432,6 +444,10 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 // The caller must hold the net mutex.
 func closeBindLocked(device *Device) error {
 	var err error
+	select { //hiddify
+	case device.stopCh <- 1:
+	default:
+	}
 	netc := &device.net
 	if netc.netlinkCancel != nil {
 		netc.netlinkCancel.Cancel()
@@ -440,6 +456,9 @@ func closeBindLocked(device *Device) error {
 		err = netc.bind.Close()
 	}
 	netc.stopping.Wait()
+	if err != nil { //hiddify
+		return fmt.Errorf("closeBindLocked %v", err)
+	}
 	return err
 }
 
@@ -482,7 +501,7 @@ func (device *Device) BindUpdate() error {
 
 	// close existing sockets
 	if err := closeBindLocked(device); err != nil {
-		return err
+		return fmt.Errorf("Closing old bind %v", err) //hiddify
 	}
 
 	// open new sockets
@@ -498,21 +517,25 @@ func (device *Device) BindUpdate() error {
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
 	if err != nil {
 		netc.port = 0
-		return err
+		recvFns, netc.port, err = netc.bind.Open(netc.port) //hiddify: retry
+		if err != nil {
+			netc.port = 0                                          //hiddify
+			return fmt.Errorf("Error in opening new bind %v", err) //hiddify
+		}
 	}
 
 	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
 	if err != nil {
 		netc.bind.Close()
 		netc.port = 0
-		return err
+		return fmt.Errorf("Error in starting route listener %v", err) //hiddify
 	}
 
 	// set fwmark
 	if netc.fwmark != 0 {
 		err = netc.bind.SetMark(netc.fwmark)
 		if err != nil {
-			return err
+			return fmt.Errorf("Error in setting mark %v", err) //hiddify
 		}
 	}
 
