@@ -14,7 +14,7 @@ import (
 )
 
 func init() {
-	ControlFns = append(ControlFns,
+	controlFns = append(controlFns,
 
 		// Attempt to set the socket buffer size beyond net.core.{r,w}mem_max by
 		// using SO_*BUFFORCE. This requires CAP_NET_ADMIN, and is allowed here to

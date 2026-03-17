@@ -6,6 +6,7 @@
 package conn
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -32,7 +34,7 @@ var (
 // methods for sending and receiving multiple datagrams per-syscall. See the
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type StdNetBind struct {
-	listener            Listener
+	externalControl     control.Func
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 
 	mu            sync.Mutex // protects all fields except as specified
@@ -53,9 +55,9 @@ type StdNetBind struct {
 	blackhole6 bool
 }
 
-func NewStdNetBind(listener Listener) Bind {
+func NewStdNetBind(externalControl control.Func) Bind {
 	return &StdNetBind{
-		listener:            listener,
+		externalControl:     externalControl,
 		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
 
 		udpAddrPool: sync.Pool{
@@ -125,7 +127,7 @@ func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
 }
 
-func listenNet(listener Listener, network string, port int) (*net.UDPConn, int, error) {
+func listenNet(externalControl control.Func, network string, port int) (*net.UDPConn, int, error) {
 	var listenerAddr string
 	if network == "udp6" {
 		listenerAddr = "[::]:" + strconv.Itoa(port)
@@ -133,7 +135,21 @@ func listenNet(listener Listener, network string, port int) (*net.UDPConn, int, 
 		listenerAddr = ":" + strconv.Itoa(port)
 	}
 
-	conn, err := listener.ListenPacketCompat(network, listenerAddr)
+	var listener net.ListenConfig
+	listener.Control = func(network, address string, conn syscall.RawConn) error {
+		for _, wgControlFn := range controlFns {
+			err := wgControlFn(network, address, conn)
+			if err != nil {
+				return err
+			}
+		}
+		if externalControl != nil {
+			return externalControl(network, address, conn)
+		} else {
+			return nil
+		}
+	}
+	conn, err := listener.ListenPacket(context.Background(), network, listenerAddr)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -174,13 +190,13 @@ again:
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
 
-	v4conn, port, err = listenNet(s.listener, "udp4", port)
+	v4conn, port, err = listenNet(s.externalControl, "udp4", port)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet(s.listener, "udp6", port)
+	v6conn, port, err = listenNet(s.externalControl, "udp6", port)
 	if uport == 0 && errors.Is(err, errEADDRINUSE) && tries < 100 {
 		v4conn.Close()
 		tries++
@@ -356,10 +372,10 @@ func (e ErrUDPGSODisabled) Unwrap() error {
 }
 
 func (s *StdNetBind) SendWithoutModify(bufs [][]byte, endpoint Endpoint) error { //hiddify
-	return s.Send(bufs, endpoint)
+	return s.Send(bufs, endpoint, 0)
 }
 
-func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
+func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
 	s.mu.Lock()
 	blackhole := s.blackhole4
 	conn := s.ipv4
@@ -410,7 +426,7 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 	}
 retry:
 	if offload {
-		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, *msgs, setGSOSize)
+		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, offset, *msgs, setGSOSize)
 		err = s.send(conn, br, (*msgs)[:n])
 		if err != nil && offload && errShouldDisableUDPGSO(err) {
 			offload = false
@@ -427,7 +443,7 @@ retry:
 	} else {
 		for i := range bufs {
 			(*msgs)[i].Addr = ua
-			(*msgs)[i].Buffers[0] = bufs[i]
+			(*msgs)[i].Buffers[0] = bufs[i][offset:]
 			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
@@ -480,7 +496,7 @@ const (
 
 type setGSOFunc func(control *[]byte, gsoSize uint16)
 
-func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs []ipv6.Message, setGSO setGSOFunc) int {
+func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, offset int, msgs []ipv6.Message, setGSO setGSOFunc) int {
 	var (
 		base     = -1 // index of msg we are currently coalescing into
 		gsoSize  int  // segmentation size of msgs[base]
@@ -492,6 +508,7 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs
 		maxPayloadLen = maxIPv6PayloadLen
 	}
 	for i, buf := range bufs {
+		buf = buf[offset:]
 		if i > 0 {
 			msgLen := len(buf)
 			baseLenBefore := len(msgs[base].Buffers[0])

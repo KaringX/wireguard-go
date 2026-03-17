@@ -15,7 +15,6 @@ import (
 
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
-
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/ratelimiter"
 	"github.com/sagernet/wireguard-go/rwcancel"
@@ -388,10 +387,10 @@ func (device *Device) RemoveAllPeers() {
 }
 
 func (device *Device) Close() {
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
 	device.state.Lock()
 	defer device.state.Unlock()
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
 		return
 	}

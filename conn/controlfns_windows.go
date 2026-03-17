@@ -12,7 +12,7 @@ import (
 )
 
 func init() {
-	ControlFns = append(ControlFns,
+	controlFns = append(controlFns,
 		func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
 				_ = windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_RCVBUF, socketBufferSize)
