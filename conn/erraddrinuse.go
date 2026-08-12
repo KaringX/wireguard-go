@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !plan9
 
 /* SPDX-License-Identifier: MIT
  *
@@ -7,4 +7,8 @@
 
 package conn
 
-func NewDefaultBind() Bind { return NewStdNetBind() }
+import "syscall"
+
+func init() {
+	errEADDRINUSE = syscall.EADDRINUSE
+}

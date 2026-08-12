@@ -9,9 +9,10 @@ import (
 	"context"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing/common/atomic"
+	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/pause"
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/ratelimiter"
@@ -286,7 +287,7 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 
 func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger *Logger, workers int) *Device {
 	device := new(Device)
-	device.pauseManager = pause.ManagerFromContext(ctx)
+	device.pauseManager = service.FromContext[pause.Manager](ctx)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
@@ -374,10 +375,10 @@ func (device *Device) RemoveAllPeers() {
 }
 
 func (device *Device) Close() {
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
 	device.state.Lock()
 	defer device.state.Unlock()
+	device.ipcMutex.Lock()
+	defer device.ipcMutex.Unlock()
 	if device.isClosed() {
 		return
 	}
@@ -467,11 +468,7 @@ func (device *Device) BindSetMark(mark uint32) error {
 	// clear cached source addresses
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
-		peer.Lock()
-		defer peer.Unlock()
-		if peer.endpoint != nil {
-			peer.endpoint.ClearSrc()
-		}
+		peer.markEndpointSrcForClearing()
 	}
 	device.peers.RUnlock()
 
@@ -521,11 +518,7 @@ func (device *Device) BindUpdate() error {
 	// clear cached source addresses
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
-		peer.Lock()
-		defer peer.Unlock()
-		if peer.endpoint != nil {
-			peer.endpoint.ClearSrc()
-		}
+		peer.markEndpointSrcForClearing()
 	}
 	device.peers.RUnlock()
 

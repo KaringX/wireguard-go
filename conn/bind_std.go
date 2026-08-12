@@ -16,11 +16,17 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
+	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
-var _ Bind = (*StdNetBind)(nil)
+var (
+	_ Bind     = (*StdNetBind)(nil)
+	_ Endpoint = (*StdNetEndpoint)(nil)
+)
 
 // StdNetBind implements Bind for all platforms. While Windows has its own Bind
 // (see bind_windows.go), it may fall back to StdNetBind.
@@ -28,6 +34,9 @@ var _ Bind = (*StdNetBind)(nil)
 // methods for sending and receiving multiple datagrams per-syscall. See the
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type StdNetBind struct {
+	externalControl     control.Func
+	reservedForEndpoint map[netip.AddrPort][3]uint8
+
 	mu            sync.Mutex // protects all fields except as specified
 	ipv4          *net.UDPConn
 	ipv6          *net.UDPConn
@@ -46,8 +55,11 @@ type StdNetBind struct {
 	blackhole6 bool
 }
 
-func NewStdNetBind() Bind {
+func NewStdNetBind(externalControl control.Func) Bind {
 	return &StdNetBind{
+		externalControl:     externalControl,
+		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
+
 		udpAddrPool: sync.Pool{
 			New: func() any {
 				return &net.UDPAddr{
@@ -58,12 +70,10 @@ func NewStdNetBind() Bind {
 
 		msgsPool: sync.Pool{
 			New: func() any {
-				// ipv6.Message and ipv4.Message are interchangeable as they are
-				// both aliases for x/net/internal/socket.Message.
 				msgs := make([]ipv6.Message, IdealBatchSize)
 				for i := range msgs {
 					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, 0, stickyControlSize+gsoControlSize)
+					msgs[i].OOB = make([]byte, controlSize)
 				}
 				return &msgs
 			},
@@ -106,7 +116,7 @@ func (e *StdNetEndpoint) DstIP() netip.Addr {
 	return e.AddrPort.Addr()
 }
 
-// See control_default,linux, etc for implementations of SrcIP and SrcIfidx.
+// See sticky_default,linux, etc for implementations of SrcIP and SrcIfidx.
 
 func (e *StdNetEndpoint) DstToBytes() []byte {
 	b, _ := e.AddrPort.MarshalBinary()
@@ -117,8 +127,29 @@ func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
 }
 
-func listenNet(network string, port int) (*net.UDPConn, int, error) {
-	conn, err := listenConfig().ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
+func listenNet(externalControl control.Func, network string, port int) (*net.UDPConn, int, error) {
+	var listenerAddr string
+	if network == "udp6" {
+		listenerAddr = "[::]:" + strconv.Itoa(port)
+	} else {
+		listenerAddr = ":" + strconv.Itoa(port)
+	}
+
+	var listener net.ListenConfig
+	listener.Control = func(network, address string, conn syscall.RawConn) error {
+		for _, wgControlFn := range controlFns {
+			err := wgControlFn(network, address, conn)
+			if err != nil {
+				return err
+			}
+		}
+		if externalControl != nil {
+			return externalControl(network, address, conn)
+		} else {
+			return nil
+		}
+	}
+	conn, err := listener.ListenPacket(context.Background(), network, listenerAddr)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -134,6 +165,11 @@ func listenNet(network string, port int) (*net.UDPConn, int, error) {
 	}
 	return conn.(*net.UDPConn), uaddr.Port, nil
 }
+
+// errEADDRINUSE is syscall.EADDRINUSE, boxed into an interface once
+// in erraddrinuse.go on almost all platforms. For other platforms,
+// it's at least non-nil.
+var errEADDRINUSE error = errors.New("")
 
 func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
@@ -154,14 +190,14 @@ again:
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
 
-	v4conn, port, err = listenNet("udp4", port)
+	v4conn, port, err = listenNet(s.externalControl, "udp4", port)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet("udp6", port)
-	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
+	v6conn, port, err = listenNet(s.externalControl, "udp6", port)
+	if uport == 0 && errors.Is(err, errEADDRINUSE) && tries < 100 {
 		v4conn.Close()
 		tries++
 		goto again
@@ -173,7 +209,7 @@ again:
 	var fns []ReceiveFunc
 	if v4conn != nil {
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
-		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		if runtime.GOOS == "linux" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
 		}
@@ -182,7 +218,7 @@ again:
 	}
 	if v6conn != nil {
 		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
-		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		if runtime.GOOS == "linux" {
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
 		}
@@ -198,7 +234,6 @@ again:
 
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 	for i := range *msgs {
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
 		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers, OOB: (*msgs)[i].OOB}
 	}
 	s.msgsPool.Put(msgs)
@@ -234,9 +269,9 @@ func (s *StdNetBind) receiveIP(
 	}
 	defer s.putMessages(msgs)
 	var numMsgs int
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+	if runtime.GOOS == "linux" {
 		if rxOffload {
-			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
+			readAt := len(*msgs) - 2
 			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
 			if err != nil {
 				return 0, err
@@ -265,8 +300,10 @@ func (s *StdNetBind) receiveIP(
 		if sizes[i] == 0 {
 			continue
 		}
-		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
-		ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
+		if msg.N > 3 {
+			common.ClearArray(bufs[i][1:4])
+		}
+		ep := &StdNetEndpoint{AddrPort: M.AddrPortFromNet(msg.Addr)} // TODO: remove allocation
 		getSrcFromControl(msg.OOB[:msg.NN], ep)
 		eps[i] = ep
 	}
@@ -288,7 +325,7 @@ func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxO
 // TODO: When all Binds handle IdealBatchSize, remove this dynamic function and
 // rename the IdealBatchSize constant to BatchSize.
 func (s *StdNetBind) BatchSize() int {
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+	if runtime.GOOS == "linux" {
 		return IdealBatchSize
 	}
 	return 1
@@ -334,7 +371,7 @@ func (e ErrUDPGSODisabled) Unwrap() error {
 	return e.RetryErr
 }
 
-func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
+func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
 	s.mu.Lock()
 	blackhole := s.blackhole4
 	conn := s.ipv4
@@ -375,9 +412,17 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 		retried bool
 		err     error
 	)
+	for _, buf := range bufs {
+		if len(buf) > offset+3 {
+			reserved, loaded := s.reservedForEndpoint[endpoint.(*StdNetEndpoint).AddrPort]
+			if loaded {
+				copy(buf[offset+1:offset+4], reserved[:])
+			}
+		}
+	}
 retry:
 	if offload {
-		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, *msgs, setGSOSize)
+		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, offset, *msgs, setGSOSize)
 		err = s.send(conn, br, (*msgs)[:n])
 		if err != nil && offload && errShouldDisableUDPGSO(err) {
 			offload = false
@@ -394,7 +439,7 @@ retry:
 	} else {
 		for i := range bufs {
 			(*msgs)[i].Addr = ua
-			(*msgs)[i].Buffers[0] = bufs[i]
+			(*msgs)[i].Buffers[0] = bufs[i][offset:]
 			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
@@ -405,13 +450,17 @@ retry:
 	return err
 }
 
+func (s *StdNetBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
+	s.reservedForEndpoint[destination] = reserved
+}
+
 func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {
 	var (
 		n     int
 		err   error
 		start int
 	)
-	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+	if runtime.GOOS == "linux" {
 		for {
 			n, err = pc.WriteBatch(msgs[start:], 0)
 			if err != nil || n == len(msgs[start:]) {
@@ -443,7 +492,7 @@ const (
 
 type setGSOFunc func(control *[]byte, gsoSize uint16)
 
-func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs []ipv6.Message, setGSO setGSOFunc) int {
+func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, offset int, msgs []ipv6.Message, setGSO setGSOFunc) int {
 	var (
 		base     = -1 // index of msg we are currently coalescing into
 		gsoSize  int  // segmentation size of msgs[base]
@@ -455,6 +504,7 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs
 		maxPayloadLen = maxIPv6PayloadLen
 	}
 	for i, buf := range bufs {
+		buf = buf[offset:]
 		if i > 0 {
 			msgLen := len(buf)
 			baseLenBefore := len(msgs[base].Buffers[0])
